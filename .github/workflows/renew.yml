@@ -67,6 +67,9 @@ jobs:
           # 多台服务器之间的间隔（秒）
           SERVER_INTERVAL: "5"
 
+          # 服务器离线时自动开机（设为 false 关闭）
+          AUTO_START: "true"
+
           IS_PROXY: ${{ env.IS_PROXY }}
           PROXY_SERVER: ${{ env.PROXY_SERVER }}
 
