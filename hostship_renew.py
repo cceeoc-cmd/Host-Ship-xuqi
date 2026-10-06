@@ -32,6 +32,15 @@ MANUAL_RUN = os.getenv(
 
 BJ_TZ = ZoneInfo("Asia/Shanghai")
 
+# 服务器离线时是否自动开机；开机后最多等待多少秒确认
+AUTO_START = os.getenv("AUTO_START", "true").lower() != "false"
+try:
+    POWER_WAIT = max(10, int(os.getenv("POWER_WAIT", "90")))
+except ValueError:
+    POWER_WAIT = 90
+# 刚进入页面时状态可能还没从 websocket 同步，离线判定前先观察这么多秒
+POWER_SETTLE = 8
+
 # 多台服务器之间的等待秒数（可用环境变量 SERVER_INTERVAL 调整）
 try:
     SERVER_INTERVAL = max(0, int(os.getenv("SERVER_INTERVAL", "5")))
@@ -219,9 +228,16 @@ TG_LIMIT = 3800
 
 def record(sid, kind, lines):
     """记录一台服务器的结果，最后合并成一条 Telegram 消息发送。
-    kind: not_due / success / error / skipped
+    kind: info（仅展示）/ not_due / success / started / error / skipped
+    同一台服务器的多条记录会合并到同一个块里。
     """
-    REPORT.append({"sid": sid, "kind": kind, "lines": lines})
+    for item in REPORT:
+        if item["sid"] == sid:
+            item["lines"].extend(lines)
+            item["kinds"].add(kind)
+            return
+
+    REPORT.append({"sid": sid, "kinds": {kind}, "lines": list(lines)})
 
 
 def record_not_due(sid, status):
@@ -286,34 +302,38 @@ def flush_report(ip):
     if not REPORT:
         return
 
-    count = {"success": 0, "not_due": 0, "error": 0, "skipped": 0}
+    def n(kind):
+        return sum(1 for item in REPORT if kind in item["kinds"])
 
-    for item in REPORT:
-        count[item["kind"]] += 1
+    bad = n("error") + n("skipped")
 
-    bad = count["error"] + count["skipped"]
-
-    if not (MANUAL_RUN or bad or count["success"]):
-        log("ℹ️ 全部未到续期时间，无需发送通知")
+    if not (MANUAL_RUN or bad or n("success") or n("started")):
+        log("ℹ️ 全部运行中且未到续期时间，无需发送通知")
         return
 
     if bad:
         title = "⚠️ Host-Ship 运行报告（有异常）"
-    elif count["success"]:
-        title = "🎉 Host-Ship 续期完成"
+    elif n("success") or n("started"):
+        title = "🎉 Host-Ship 运行报告"
     else:
         title = "⏳ Host-Ship 检查完成"
 
     parts = []
 
-    if count["success"]:
-        parts.append(f"续期成功 {count['success']}")
+    if n("success"):
+        parts.append(f"续期成功 {n('success')}")
 
-    if count["not_due"]:
-        parts.append(f"未到期 {count['not_due']}")
+    if n("started"):
+        parts.append(f"已自动开机 {n('started')}")
+
+    if n("not_due"):
+        parts.append(f"未到期 {n('not_due')}")
 
     if bad:
         parts.append(f"异常 {bad}")
+
+    if not parts:
+        parts.append("全部正常")
 
     now = beijing_now()
 
@@ -760,6 +780,155 @@ def discover_servers(page):
     return urls
 
 
+def read_uptime(page):
+    """读取面板 UPTIME 卡片的值，如 'Offline' 或 '0h 1m 22s'；读不到返回 None。"""
+    text = page.locator("body").inner_text()
+
+    match = re.search(r"UPTIME\s*\n\s*([^\n]+)", text, re.I)
+
+    return match.group(1).strip() if match else None
+
+
+def find_start_button(page):
+    """返回可点击的 Start 按钮（不会误匹配 Restart）。"""
+    candidates = [
+        page.get_by_role(
+            "button",
+            name=re.compile(r"^\s*Start\s*$", re.I),
+        ),
+        page.locator(
+            "button",
+            has_text=re.compile(r"^\s*Start\s*$", re.I),
+        ),
+    ]
+
+    for group in candidates:
+        try:
+            for i in range(group.count()):
+                item = group.nth(i)
+
+                if item.is_visible() and item.is_enabled():
+                    return item
+
+        except Exception:
+            pass
+
+    return None
+
+
+def power_state(page):
+    """返回 running / offline / unknown。"""
+    uptime = read_uptime(page)
+
+    if uptime is None:
+        # 没有 UPTIME 卡片：Start 可点击说明离线，不可点击说明不是离线
+        return "offline" if find_start_button(page) else "running"
+
+    if uptime.lower() == "offline":
+        return "offline"
+
+    if re.search(r"\d", uptime):
+        return "running"
+
+    return "unknown"  # 如 Starting / Stopping
+
+
+def settled_power_state(page, seconds=POWER_SETTLE):
+    """刚进页面时状态可能还没同步，持续观察几秒，运行中则立刻返回。"""
+    state = power_state(page)
+    waited = 0
+
+    while state != "running" and waited < seconds:
+        page.wait_for_timeout(1000)
+        waited += 1
+        state = power_state(page)
+
+    return state
+
+
+def uptime_line(page):
+    """UPTIME 卡片的内容，如 11d 5h 34m，生成一行通知文本。"""
+    uptime = read_uptime(page)
+
+    return [f"🕰️ 运行时长：{uptime}"] if uptime else []
+
+
+def ensure_running(page, sid):
+    """检查电源状态，离线则自动开机。返回 False 表示开机失败。"""
+    state = settled_power_state(page)
+
+    if state == "running":
+        log("🟢 服务器运行中")
+        record(
+            sid,
+            "info",
+            ["⚡ 状态：运行中"] + uptime_line(page),
+        )
+        return True
+
+    if state != "offline":
+        log(f"⚠️ 无法识别服务器状态：{read_uptime(page)}")
+        record(sid, "info", ["⚡ 状态：未识别（已跳过开机检查）"])
+        return True
+
+    log("🔴 服务器离线")
+
+    if not AUTO_START:
+        record(sid, "info", ["⚡ 状态：离线（未启用自动开机）"])
+        return True
+
+    button = find_start_button(page)
+
+    if not button:
+        page.screenshot(
+            path=f"hostship_{sid}_start_missing.png",
+            full_page=True,
+        )
+
+        record_error(
+            sid,
+            "❌ 服务器离线，无法开机",
+            "没有找到可点击的 Start 按钮（可能被暂停或正在安装）",
+        )
+
+        return False
+
+    log("⚡ 点击 Start 开机...")
+
+    button.click()
+
+    waited = 0
+
+    while waited < POWER_WAIT:
+        page.wait_for_timeout(3000)
+        waited += 3
+
+        if power_state(page) == "running":
+            log(f"✅ 开机成功（约 {waited} 秒）")
+
+            record(
+                sid,
+                "started",
+                ["⚡ 状态：离线 → 已自动开机 ✅"]
+                + uptime_line(page),
+            )
+
+            return True
+
+    page.screenshot(
+        path=f"hostship_{sid}_start_fail.png",
+        full_page=True,
+    )
+
+    record_error(
+        sid,
+        "❌ 自动开机失败",
+        f"点击 Start 后 {POWER_WAIT} 秒内仍未运行",
+    )
+
+    return False
+
+
 def process_server(page, url, sid, ip):
     """处理单台服务器，返回 0 成功/无需操作，1 失败，LOGIN_FAILED 登录失败。"""
     if not login_if_needed(page, url):
@@ -793,6 +962,15 @@ def process_server(page, url, sid, ip):
 
     log("✅ 页面已就绪")
 
+    power_ok = ensure_running(page, sid)
+
+    code = renew_server(page, sid)
+
+    return code if code != 0 else (0 if power_ok else 1)
+
+
+def renew_server(page, sid):
+    """检查并执行续期，返回 0 成功/无需操作，1 失败。"""
     before = get_renewal_text(page)
 
     log(f"📅 当前续期状态：{before}")
