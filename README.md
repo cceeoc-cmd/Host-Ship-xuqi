@@ -5,11 +5,14 @@
 ## 功能
 
 - 每天北京时间 08:00 自动检查一次
+- 多台服务器的结果合并成一条 Telegram 消息，用分割线分开；定时运行只有出现续期或异常时才发，手动运行始终发送
+- 每次运行结束后自动清理旧的运行记录，仅保留最新 3 条
 - 仅在 Host-Ship 页面出现可用的 `Renew` 按钮时尝试续期
 - 未到续期窗口时不会点击续期
 - 手动运行时会发送 Telegram 检查结果
 - 真正续期成功、失败或异常时发送 Telegram
 - Telegram 中显示：
+  - 登录账号（从账号页读取，脱敏显示，如 `a***a@email.com`）
   - 服务器编号
   - 节点状态
   - 当前出口 IP
@@ -36,6 +39,16 @@
 Host-Ship 服务器详情页完整地址，例如：
 
 `https://panel.host-ship.com/server/xxxxxxxx`
+
+**留空则自动扫描**：不设置 `SERVER_URL` 时，脚本登录后会读取仪表盘上的服务器列表并逐台处理。分享给你的（子用户）服务器也会被扫到，它们可能没有 Renew 按钮并报错，这种情况建议手动填写 `SERVER_URL`。\n\n**支持多台服务器**：填多个地址即可，用换行、空格、逗号或分号分隔（重复的会自动去重），例如：
+
+```
+https://panel.host-ship.com/server/aaaaaaaa
+https://panel.host-ship.com/server/bbbbbbbb
+https://panel.host-ship.com/server/cccccccc
+```
+
+多台服务器需要属于同一个 Host-Ship 账号，只登录一次，依次检查并续期。每台服务器单独发送 Telegram 通知，某一台失败不影响其他台；如果登录失败或遇到验证码，会直接停止并跳过剩余服务器。
 
 `HOSTSHIP_LOGIN`
 
